@@ -96,6 +96,30 @@ kbd { padding: 5px 8px; color: #fdf9f1; border-radius: 5px; background: #44382e;
   .project-title { display: none; }
   .form-grid { grid-template-columns: 1fr 1fr; }
 }
+.drawer-content.drawer-readonly { pointer-events: none; opacity: .65; }
+.drawer-content.drawer-readonly input, .drawer-content.drawer-readonly .MuiSelect-select { background: rgba(120,110,95,.07); }
+
+/* ---- 双标签页协作 ---- */
+.collab-inline-alert { margin: 6px 20px 0; }
+.collab-banner { margin: 10px 20px 0; padding: 10px 14px; border: 1px solid #cda77f !important; border-radius: 10px !important; background: #fffaf0 !important; }
+.collab-banner.idle { border-color: #d8d0c4 !important; background: #faf7f0 !important; }
+.collab-badge-wrap { position: relative; display: inline-flex; }
+.collab-badge-dot { position: absolute; top: 2px; right: 2px; width: 8px; height: 8px; border: 1.5px solid #faf7f0; border-radius: 50%; background: #d07a1f; }
+
+.merge-dialog .MuiPaper-root { max-height: 88vh; }
+.merge-section { padding: 16px 18px; border: 1px solid #ddd3c5 !important; border-radius: 12px !important; background: #fbf8f2 !important; }
+.merge-auto-list .MuiListItem-root { align-items: center; padding: 6px 0; border-bottom: 1px dashed #e4ddd2; }
+.merge-conflict { padding: 16px; border: 1px solid #e0b487 !important; border-left: 4px solid #d07a1f !important; border-radius: 11px !important; background: #fff9f0 !important; }
+.merge-conflict.is-resolved { border-color: #9cc3aa !important; border-left-color: #377760 !important; background: #f8fcf7 !important; }
+.merge-side-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.merge-side-grid.compact { margin-top: 2px; }
+.merge-side { padding: 10px 12px; border: 1.5px solid #d6cdbf; border-radius: 9px; background: #fff; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
+.merge-side:hover { border-color: #ad8668; }
+.merge-side.chosen { border-color: #377760; box-shadow: inset 0 0 0 1px #377760; background: #f4faf5; }
+.merge-side-value { color: #4a433a; font-size: 13px; line-height: 1.6; word-break: break-word; }
+.merge-field-row { display: grid; grid-template-columns: 92px 1fr; gap: 10px; align-items: start; }
+.merge-orphan { padding: 10px 12px; border: 1px dashed #d9b892 !important; border-radius: 9px !important; background: #fffdf7 !important; }
+
 @media (max-width: 720px) {
   .toolbar { min-height: auto !important; padding: 10px 12px !important; gap: 10px; }
   .toolbar > .MuiStack-root:last-child .MuiButton-root { min-width: 40px; padding: 8px; font-size: 0; }
@@ -113,4 +137,8 @@ kbd { padding: 5px 8px; color: #fdf9f1; border-radius: 5px; background: #44382e;
   .diff-row { grid-template-columns: 1fr; }
   .diff-arrow { transform: rotate(90deg); }
   .timeline-card { grid-template-columns: 1fr; }
+  .merge-side-grid { grid-template-columns: 1fr; }
+  .merge-field-row { grid-template-columns: 1fr; }
+  .collab-banner { margin: 8px 10px 0; }
 }
+

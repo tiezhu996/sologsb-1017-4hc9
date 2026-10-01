@@ -46,6 +46,7 @@ import {
   WarningAmber
 } from '@mui/icons-material'
 import { diffScript, useContinuityStore } from './store'
+import { CollabControls, CollabToolbarButton } from './Collab'
 import type { RevisionColor, Scene, WarningItem, WarningStatus } from './types'
 
 const revisionOptions: Array<{ value: RevisionColor; label: string; color: string }> = [
@@ -104,7 +105,7 @@ function SceneCard({ scene, query, active, onOpen }: { scene: Scene; query: stri
 
 export default function App() {
   const store = useContinuityStore()
-  const { state, warnings } = store
+  const { state, warnings, collab } = store
   const [selectedSceneId, setSelectedSceneId] = useState(state.script.scenes[0]?.id ?? '')
   const [view, setView] = useState<'outline' | 'detail' | 'warnings' | 'versions'>('outline')
   const [query, setQuery] = useState('')
@@ -193,7 +194,7 @@ export default function App() {
             <Typography variant="h4">故事大纲</Typography>
             <Typography color="text.secondary">按当前场次顺序检查人物出场、道具建立与时间推进。</Typography>
           </Box>
-          <Button variant="contained" startIcon={<Add />} onClick={() => { const sceneId = store.addScene(); setSelectedSceneId(sceneId); setView('detail') }}>新增场景</Button>
+          <Button variant="contained" disabled={!collab.canEditScript} startIcon={<Add />} onClick={() => { const sceneId = store.addScene(); setSelectedSceneId(sceneId); setView('detail') }}>新增场景</Button>
         </Stack>
         <Box className="outline-grid">
           {state.script.scenes.map((scene) => <SceneCard key={scene.id} scene={scene} query={query} active={scene.id === selectedScene?.id} onOpen={() => openScene(scene.id)} />)}
@@ -205,7 +206,7 @@ export default function App() {
   function renderSceneDetail() {
     if (!selectedScene) return null
     const sceneWarnings = warnings.filter((warning) => warning.sceneId === selectedScene.id)
-    const locked = selectedScene.status === 'locked'
+    const locked = selectedScene.status === 'locked' || !collab.canEditScript
     return (
       <Box className="detail-page">
         <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" gap={2} alignItems={{ md: 'flex-start' }}>
@@ -236,6 +237,12 @@ export default function App() {
           <Alert severity="warning" icon={<WarningAmber />} sx={{ mt: 2 }}>
             本场有 {sceneWarnings.length} 条连续性问题：{sceneWarnings.map((warning) => warning.title).join('、')}
             <Button size="small" onClick={() => setView('warnings')}>前往审阅</Button>
+          </Alert>
+        )}
+
+        {!collab.canEditScript && (
+          <Alert severity="info" sx={{ mt: sceneWarnings.length ? 0 : 2 }}>
+            协作中剧本归场记甲（场景/道具/服装）所有，本标签页（场记乙）只能处理警告与回复，不能改场景。
           </Alert>
         )}
 
@@ -367,8 +374,8 @@ export default function App() {
                   <Chip label={review.status === 'accepted' ? '已接受' : review.status === 'ignored' ? '已忽略' : '待审'} color={review.status === 'accepted' ? 'success' : review.status === 'ignored' ? 'default' : 'warning'} />
                 </Box>
                 <Stack direction="row" gap={1} mt={1.5} flexWrap="wrap">
-                  <Button size="small" variant={review.status === 'accepted' ? 'contained' : 'outlined'} startIcon={<CheckCircle />} onClick={() => store.setReviewStatus(warning.id, 'accepted')}>接受问题</Button>
-                  <Button size="small" variant={review.status === 'ignored' ? 'contained' : 'outlined'} color="inherit" startIcon={<Block />} onClick={() => store.setReviewStatus(warning.id, 'ignored')}>忽略警告</Button>
+                  <Button size="small" disabled={!collab.canReview} variant={review.status === 'accepted' ? 'contained' : 'outlined'} startIcon={<CheckCircle />} onClick={() => store.setReviewStatus(warning.id, 'accepted')}>接受问题</Button>
+                  <Button size="small" disabled={!collab.canReview} variant={review.status === 'ignored' ? 'contained' : 'outlined'} color="inherit" startIcon={<Block />} onClick={() => store.setReviewStatus(warning.id, 'ignored')}>忽略警告</Button>
                   <Button size="small" onClick={() => openScene(warning.sceneId)}>打开场景</Button>
                 </Stack>
                 {review.replies.length > 0 && (
@@ -387,7 +394,8 @@ export default function App() {
                     fullWidth
                     multiline
                     maxRows={3}
-                    placeholder="作者回复：说明修改理由或保留原设定"
+                    disabled={!collab.canReview}
+                    placeholder={collab.canReview ? '作者回复：说明修改理由或保留原设定' : '协作中审阅决定归场记乙，本标签页只读'}
                     value={replyDrafts[warning.id] ?? ''}
                     onChange={(event) => setReplyDrafts((previous) => ({ ...previous, [warning.id]: event.target.value }))}
                     onKeyDown={(event) => {
@@ -397,7 +405,7 @@ export default function App() {
                       }
                     }}
                   />
-                  <Button startIcon={<Reply />} variant="outlined" onClick={() => {
+                  <Button disabled={!collab.canReview} startIcon={<Reply />} variant="outlined" onClick={() => {
                     store.addReply(warning.id, state.script.writer, replyDrafts[warning.id] ?? '')
                     setReplyDrafts((previous) => ({ ...previous, [warning.id]: '' }))
                   }}>回复</Button>
@@ -429,8 +437,11 @@ export default function App() {
               {state.versions.map((version) => (
                 <ListItemButton key={version.id} selected={version.id === selectedVersion?.id} onClick={() => setSelectedVersionId(version.id)}>
                   <Box>
-                    <Typography fontWeight={700}>{version.name}</Typography>
-                    <Typography variant="caption" color="text.secondary">{new Date(version.createdAt).toLocaleString('zh-CN')}</Typography>
+                    <Stack direction="row" gap={0.5} alignItems="center">
+                      <Typography fontWeight={700}>{version.name}</Typography>
+                      {version.preMerge && <Chip size="small" color="secondary" label="合并前完整稿" />}
+                    </Stack>
+                    <Typography variant="caption" color="text.secondary">{new Date(version.createdAt).toLocaleString('zh-CN')}{version.reviews ? ' · 含审阅决定' : ''}</Typography>
                   </Box>
                 </ListItemButton>
               ))}
@@ -476,7 +487,7 @@ export default function App() {
             </Box>
           </Stack>
           <Stack direction="row" gap={1} alignItems="center" className="project-title">
-            <input value={state.script.title} aria-label="剧本标题" onChange={(event) => store.updateScriptField('title', event.target.value)} />
+            <input value={state.script.title} aria-label="剧本标题" disabled={!collab.canEditScript} onChange={(event) => store.updateScriptField('title', event.target.value)} />
             <span>{state.script.draft}</span>
           </Stack>
           <TextField
@@ -490,8 +501,8 @@ export default function App() {
           <Stack direction="row" gap={.5}>
             <Tooltip title="撤销 ⌘Z"><IconButton onClick={store.undo}><Undo /></IconButton></Tooltip>
             <Tooltip title="重做 ⇧⌘Z"><IconButton onClick={store.redo}><Redo /></IconButton></Tooltip>
-            <Tooltip title="资料库"><IconButton onClick={() => setLibraryOpen(true)}><Storage /></IconButton></Tooltip>
-            <Tooltip title="键盘快捷键"><IconButton onClick={() => setShortcutOpen(true)}><Keyboard /></IconButton></Tooltip>
+            <CollabToolbarButton session={collab.activeSession} />
+            <Tooltip title="资料库"><IconButton onClick={() => setLibraryOpen(true)}><Storage /></IconButton></Tooltip>            <Tooltip title="键盘快捷键"><IconButton onClick={() => setShortcutOpen(true)}><Keyboard /></IconButton></Tooltip>
             <Button variant="contained" startIcon={<Save />} onClick={() => setVersionDialog(true)}>保存版本</Button>
           </Stack>
         </Toolbar>
@@ -501,8 +512,10 @@ export default function App() {
         <span>{store.saveStatus === 'saved' ? '● 已保存到本机' : '◌ 正在保存'}</span>
         <span>{state.script.scenes.length} 场 / {state.script.scenes.reduce((total, scene) => total + scene.pageLength, 0).toFixed(2)} 页</span>
         <span className={pendingWarnings.length ? 'attention' : ''}>{pendingWarnings.length} 条问题待审</span>
-        <span>所有修改自动保存在浏览器本地</span>
+        <span>{collab.joined ? `协作身份：${collab.role === 'script' ? '场记甲（剧本）' : '场记乙（审阅）'}` : '所有修改自动保存在浏览器本地'}</span>
       </Box>
+
+      <CollabControls store={store} />
 
       <Box className="scene-rail">
         <IconButton size="small" onClick={() => {
@@ -564,7 +577,12 @@ export default function App() {
           <Tab value="wardrobe" label="服装" />
           <Tab value="timeline" label="时间线" />
         </Tabs>
-        <Box className="drawer-content">
+        {!collab.canEditScript && (
+          <Alert severity="info" sx={{ mx: 2, mt: 1 }} icon={<Block fontSize="small" />}>
+            协作中资料库归场记甲所有，场记乙身份下为只读。
+          </Alert>
+        )}
+        <Box className={`drawer-content ${collab.canEditScript ? '' : 'drawer-readonly'}`}>
           {libraryTab === 'characters' && (
             <Stack gap={1.5}>
               <Button startIcon={<Add />} variant="outlined" onClick={store.addCharacter}>新增角色</Button>
