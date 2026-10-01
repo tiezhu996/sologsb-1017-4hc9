@@ -14,6 +14,7 @@ import {
   Drawer,
   IconButton,
   InputAdornment,
+  Link,
   List,
   ListItemButton,
   MenuItem,
@@ -33,20 +34,24 @@ import {
   Block,
   CheckCircle,
   Close,
-  Storage,
-  Difference,
+  Groups,
   Keyboard,
+  Merge,
   NavigateBefore,
   NavigateNext,
+  PauseCircle,
   Redo,
   Reply,
   Save,
   Search,
+  Storage,
+  Difference,
   Undo,
   WarningAmber
 } from '@mui/icons-material'
-import { diffScript, useContinuityStore } from './store'
-import type { RevisionColor, Scene, WarningItem, WarningStatus } from './types'
+import { diffScript, listWorkspaces, useContinuityStore, workspaceUrl } from './store'
+import { formatMergeValue } from './merge'
+import type { MergeConflict, RevisionColor, Scene, Script, WarningItem, WarningStatus, WorkspaceSummary } from './types'
 
 const revisionOptions: Array<{ value: RevisionColor; label: string; color: string }> = [
   { value: 'white', label: '白纸', color: '#f7f5ee' },
@@ -62,6 +67,21 @@ const revisionOptions: Array<{ value: RevisionColor; label: string; color: strin
 const dayNightOptions = ['白天', '夜', '清晨', '黄昏', '傍晚']
 const timePeriods = ['白天', '夜', '清晨', '黄昏', '傍晚']
 const searchFields = ['slug', 'synopsis', 'location', 'storyTime', 'reason'] as const
+
+function formatConflictValue(value: unknown, script: Script, kind?: string, field?: string) {
+  if (Array.isArray(value) && (kind === 'order' || field === 'introducedSceneId' || field === 'characterId' || field === 'ownerId')) {
+    const entities = (script as { scenes?: Scene[]; characters?: Array<{ id: string; name: string }> }) ?? {}
+    const all = [...(entities.scenes ?? []), ...(entities.characters ?? [])]
+    return value.length ? value.map((item) => {
+      const scene = (entities.scenes ?? []).find((entry) => entry.id === item)
+      const character = (entities.characters ?? []).find((entry) => entry.id === item)
+      if (scene) return `场景 ${scene.number} · ${scene.slug}`
+      if (character) return character.name
+      return formatMergeValue(item)
+    }).join(' → ') : '空'
+  }
+  return formatMergeValue(value)
+}
 
 function Highlight({ text, query }: { text: string; query: string }) {
   if (!query.trim()) return <>{text}</>
@@ -106,7 +126,8 @@ export default function App() {
   const store = useContinuityStore()
   const { state, warnings } = store
   const [selectedSceneId, setSelectedSceneId] = useState(state.script.scenes[0]?.id ?? '')
-  const [view, setView] = useState<'outline' | 'detail' | 'warnings' | 'versions'>('outline')
+  const [view, setView] = useState<'outline' | 'detail' | 'warnings' | 'merge' | 'versions'>(state.activeMerge ? 'merge' : 'outline')
+  const [hasRedirectedToMerge, setHasRedirectedToMerge] = useState(Boolean(state.activeMerge))
   const [query, setQuery] = useState('')
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [libraryTab, setLibraryTab] = useState('characters')
@@ -116,9 +137,17 @@ export default function App() {
   const [warningFilter, setWarningFilter] = useState<'all' | WarningStatus>('all')
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({})
   const [shortcutOpen, setShortcutOpen] = useState(false)
+  const [collaborationOpen, setCollaborationOpen] = useState(false)
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([])
+  const [mergeNotice, setMergeNotice] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
 
   const selectedScene = state.script.scenes.find((scene) => scene.id === selectedSceneId) ?? state.script.scenes[0]
+  const isPaired = Boolean(state.workspace?.partnerId)
+  const canEditScript = !state.activeMerge && (!isPaired || state.workspace?.role === 'production')
+  const canReview = !state.activeMerge && (!isPaired || state.workspace?.role === 'review')
+  const mergeSession = state.activeMerge ?? null
+  const unresolvedConflicts = mergeSession?.conflicts.filter((conflict) => !conflict.resolution) ?? []
   const pendingWarnings = warnings.filter((warning) => (state.reviews[warning.id]?.status ?? 'pending') === 'pending')
   const visibleWarnings = warnings.filter((warning) => warningFilter === 'all' || (state.reviews[warning.id]?.status ?? 'pending') === warningFilter)
   const selectedVersion = state.versions.find((version) => version.id === selectedVersionId) ?? state.versions[0]
@@ -135,6 +164,14 @@ export default function App() {
   useEffect(() => {
     if (!state.script.scenes.some((scene) => scene.id === selectedSceneId)) setSelectedSceneId(state.script.scenes[0]?.id ?? '')
   }, [selectedSceneId, state.script.scenes])
+
+  useEffect(() => {
+    if (state.activeMerge && !hasRedirectedToMerge) {
+      setView('merge')
+      setHasRedirectedToMerge(true)
+    }
+    if (!state.activeMerge) setHasRedirectedToMerge(false)
+  }, [state.activeMerge, hasRedirectedToMerge])
 
   useEffect(() => {
     const onKeydown = (event: KeyboardEvent) => {
@@ -155,7 +192,7 @@ export default function App() {
         event.preventDefault()
       } else if (event.key === 'Escape') {
         setQuery('')
-      } else if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown') && selectedScene) {
+      } else if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown') && selectedScene && canEditScript) {
         event.preventDefault()
         store.moveScene(selectedScene.id, event.key === 'ArrowUp' ? -1 : 1)
       } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
@@ -177,11 +214,139 @@ export default function App() {
     setView('detail')
   }
 
+  function openCollaboration() {
+    setWorkspaces(listWorkspaces())
+    setCollaborationOpen(true)
+  }
+
+  function handleStartMerge() {
+    const result = store.startMerge()
+    if (!result.ok) setMergeNotice(result.message ?? '无法开始合并。')
+    else {
+      setMergeNotice('')
+      setView('merge')
+    }
+  }
+
+  function handleCompleteMerge() {
+    const result = store.completeMerge()
+    if (result.ok) {
+      setView('versions')
+      setMergeNotice('')
+    } else {
+      setMergeNotice(result.message ?? '无法完成合并。')
+    }
+  }
+
   function createVersion() {
     const version = store.createVersion(versionName)
     setSelectedVersionId(version.id)
     setVersionName('')
     setVersionDialog(false)
+  }
+
+  function renderConflict(conflict: MergeConflict) {
+    const sourceScript = conflict.kind === 'order'
+      ? state.activeMerge?.mergedScript ?? state.script
+      : (conflict.resolution === 'review' ? state.activeMerge?.reviewDraft.script : state.activeMerge?.productionDraft.script) ?? state.script
+    const values: Array<{ side: 'production' | 'review'; label: string; value: unknown; color: string }> = [
+      { side: 'production', label: state.activeMerge?.productionWorkspaceName ?? '场景道具工作稿', value: conflict.production, color: '#7b4b2a' },
+      { side: 'review', label: state.activeMerge?.reviewWorkspaceName ?? '审阅与回复工作稿', value: conflict.review, color: '#2f6f67' }
+    ]
+    return (
+      <Paper key={conflict.id} className={`merge-conflict ${conflict.resolution ? 'resolved' : 'unresolved'}`} elevation={0}>
+        <Stack direction="row" justifyContent="space-between" gap={2} flexWrap="wrap">
+          <Box>
+            <Chip size="small" color={conflict.resolution ? 'success' : 'warning'} label={conflict.resolution ? '已选定' : '待选定'} />
+            <Typography variant="h6" mt={1}>{conflict.entityLabel ?? '剧本信息'} / {conflict.fieldLabel}</Typography>
+            <Typography variant="body2" color="text.secondary">同一字段在两稿中都改过，合并稿暂不替你决定。</Typography>
+          </Box>
+        </Stack>
+        <Box className="conflict-options">
+          {values.map((option) => (
+            <button
+              key={option.side}
+              type="button"
+              className={`conflict-option ${conflict.resolution === option.side ? 'selected' : ''}`}
+              onClick={() => store.resolveMergeConflict(conflict.id, option.side)}
+            >
+              <span className="conflict-option-role" style={{ color: option.color }}>{option.label}</span>
+              <strong>{formatConflictValue(option.value, sourceScript, conflict.kind, conflict.field)}</strong>
+            </button>
+          ))}
+        </Box>
+      </Paper>
+    )
+  }
+
+  function renderMerge() {
+    if (!mergeSession) {
+      return (
+        <Paper className="merge-page" elevation={0}>
+          <Merge sx={{ fontSize: 46, color: '#7b4b2a' }} />
+          <Typography variant="h4" mt={2}>双人工作稿合并</Typography>
+          <Typography color="text.secondary" sx={{ maxWidth: 720 }}>
+            先开启双人分工：一个标签页维护场景、道具和服装，另一个标签页处理连续性警告、接受/忽略决定与作者回复。恢复联网或回到本机后，再从共同基线做三方合并。
+          </Typography>
+          <Alert severity="info" sx={{ mt: 2 }}>场景、道具、服装只有一方改动会自动合入；同一字段双方都改会保留两版，必须人工选定。审阅决定只跟随完整匹配的旧警告，不会套到新场景。</Alert>
+          {!isPaired && <Alert severity="warning" sx={{ mt: 2 }}>当前是个人工作稿，尚未绑定另一个标签页。</Alert>}
+          {mergeNotice && <Alert severity="error" sx={{ mt: 2 }}>{mergeNotice}</Alert>}
+          <Stack direction="row" gap={1} mt={3} flexWrap="wrap">
+            <Button variant="contained" startIcon={<Groups />} onClick={openCollaboration}>打开双人分工</Button>
+            <Button startIcon={<Merge />} disabled={!isPaired} onClick={handleStartMerge}>检查并开始合并</Button>
+          </Stack>
+        </Paper>
+      )
+    }
+
+    return (
+      <Box>
+        <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" gap={2} alignItems={{ md: 'center' }}>
+          <Box>
+            <Typography className="eyebrow">RECOVERABLE MERGE</Typography>
+            <Typography variant="h4">待选定的字段冲突</Typography>
+            <Typography color="text.secondary">
+              {mergeSession.name} · 中断、刷新或关闭页面后，待选定内容会随两个工作稿一起保存在本机。
+            </Typography>
+          </Box>
+          <Stack direction="row" gap={1} flexWrap="wrap">
+            <Button startIcon={<PauseCircle />} onClick={() => setView('outline')}>暂停并保留待选定内容</Button>
+            <Button variant="contained" color="success" startIcon={<CheckCircle />} disabled={unresolvedConflicts.length > 0} onClick={handleCompleteMerge}>
+              {unresolvedConflicts.length ? `还有 ${unresolvedConflicts.length} 项待选` : '完成合并'}
+            </Button>
+          </Stack>
+        </Stack>
+
+        {mergeNotice && <Alert severity={unresolvedConflicts.length ? 'warning' : 'error'} sx={{ mt: 2 }}>{mergeNotice}</Alert>}
+        <Alert severity="success" sx={{ mt: 2 }}>
+          已自动合入 {mergeSession.autoChanges.length} 处单方修改或相同修改；{mergeSession.conflicts.length} 处字段级分歧保留两版供选择。
+        </Alert>
+
+        <Box className="merge-ownership">
+          <Paper elevation={0}><Groups /><strong>工作稿所有权</strong><span>场景、道具、服装以字段合并；没有打架自动合入。</span></Paper>
+          <Paper elevation={0}><WarningAmber /><strong>审阅所有权</strong><span>警告状态和回复只随完整匹配的旧警告，不迁移到新场景。</span></Paper>
+          <Paper elevation={0}><Save /><strong>合并前完整稿</strong><span>已冻结两个工作稿的剧本与审阅快照，可从版本页撤销。</span></Paper>
+        </Box>
+
+        <Typography variant="h5" mt={4} mb={2}>{unresolvedConflicts.length ? `待选定（${unresolvedConflicts.length}）` : '所有分歧已选定'}</Typography>
+        <Stack gap={1.5}>
+          {mergeSession.conflicts.length ? mergeSession.conflicts.map(renderConflict) : <Alert severity="success">没有字段冲突，可以完成合并。</Alert>}
+        </Stack>
+
+        <Paper className="auto-merge-panel" elevation={0}>
+          <Typography variant="h6">自动合入与迁移说明</Typography>
+          <List dense>
+            {mergeSession.autoChanges.map((change) => (
+              <Box key={change.id} className="auto-merge-row">
+                <Chip size="small" label={change.side === 'both' ? '双方' : change.side === 'production' ? '场景道具稿' : '审阅稿'} />
+                <strong>{change.label}</strong>
+                <span>{change.detail}</span>
+              </Box>
+            ))}
+          </List>
+        </Paper>
+      </Box>
+    )
   }
 
   function renderOutline() {
@@ -193,7 +358,7 @@ export default function App() {
             <Typography variant="h4">故事大纲</Typography>
             <Typography color="text.secondary">按当前场次顺序检查人物出场、道具建立与时间推进。</Typography>
           </Box>
-          <Button variant="contained" startIcon={<Add />} onClick={() => { const sceneId = store.addScene(); setSelectedSceneId(sceneId); setView('detail') }}>新增场景</Button>
+          <Button variant="contained" startIcon={<Add />} disabled={!canEditScript} onClick={() => { const sceneId = store.addScene(); setSelectedSceneId(sceneId); setView('detail') }}>新增场景</Button>
         </Stack>
         <Box className="outline-grid">
           {state.script.scenes.map((scene) => <SceneCard key={scene.id} scene={scene} query={query} active={scene.id === selectedScene?.id} onOpen={() => openScene(scene.id)} />)}
@@ -205,7 +370,7 @@ export default function App() {
   function renderSceneDetail() {
     if (!selectedScene) return null
     const sceneWarnings = warnings.filter((warning) => warning.sceneId === selectedScene.id)
-    const locked = selectedScene.status === 'locked'
+    const locked = selectedScene.status === 'locked' || !canEditScript
     return (
       <Box className="detail-page">
         <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" gap={2} alignItems={{ md: 'flex-start' }}>
@@ -226,9 +391,9 @@ export default function App() {
             </Stack>
           </Box>
           <Stack direction="row" gap={1} flexWrap="wrap">
-            <Button variant="outlined" onClick={() => store.moveScene(selectedScene.id, -1)}>上移</Button>
-            <Button variant="outlined" onClick={() => store.moveScene(selectedScene.id, 1)}>下移</Button>
-            <Button color="error" onClick={() => { store.deleteScene(selectedScene.id); setView('outline') }}>删除</Button>
+            <Button variant="outlined" disabled={!canEditScript} onClick={() => store.moveScene(selectedScene.id, -1)}>上移</Button>
+            <Button variant="outlined" disabled={!canEditScript} onClick={() => store.moveScene(selectedScene.id, 1)}>下移</Button>
+            <Button color="error" disabled={!canEditScript} onClick={() => { store.deleteScene(selectedScene.id); setView('outline') }}>删除</Button>
           </Stack>
         </Stack>
 
@@ -332,15 +497,17 @@ export default function App() {
           <Box>
             <Typography className="eyebrow">CONTINUITY REVIEW</Typography>
             <Typography variant="h4">连续性问题</Typography>
-            <Typography color="text.secondary">审阅人可接受或忽略；作者回复与修改理由保存在本机。</Typography>
+            <Typography color="text.secondary">审阅状态与作者回复按警告身份归属自己的工作稿；合并时只有内容、场景和身份完全一致的决定才会迁移。</Typography>
           </Box>
-          <ToggleButtonGroup exclusive size="small" value={warningFilter} onChange={(_, value) => value && setWarningFilter(value)}>
+          <ToggleButtonGroup exclusive size="small" value={warningFilter} onChange={(_, value) => value && setWarningFilter(value)} disabled={!canReview}>
             <ToggleButton value="all">全部 {warnings.length}</ToggleButton>
             <ToggleButton value="pending">待审 {pendingWarnings.length}</ToggleButton>
             <ToggleButton value="accepted">已接受</ToggleButton>
             <ToggleButton value="ignored">已忽略</ToggleButton>
           </ToggleButtonGroup>
         </Stack>
+        {isPaired && !canReview && <Alert severity="info" sx={{ mb: 2 }}>当前是场景道具工作稿。警告接受/忽略和回复请在配套的审阅标签页中处理。</Alert>}
+        {state.activeMerge && <Alert severity="warning" sx={{ mb: 2 }}>正在合并；审阅决定已冻结，完成或暂停合并后才能继续处理。</Alert>}
         <Stack gap={1.5}>
           {visibleWarnings.map((warning) => {
             const review = state.reviews[warning.id] ?? { status: 'pending' as WarningStatus, replies: [] }
@@ -367,8 +534,8 @@ export default function App() {
                   <Chip label={review.status === 'accepted' ? '已接受' : review.status === 'ignored' ? '已忽略' : '待审'} color={review.status === 'accepted' ? 'success' : review.status === 'ignored' ? 'default' : 'warning'} />
                 </Box>
                 <Stack direction="row" gap={1} mt={1.5} flexWrap="wrap">
-                  <Button size="small" variant={review.status === 'accepted' ? 'contained' : 'outlined'} startIcon={<CheckCircle />} onClick={() => store.setReviewStatus(warning.id, 'accepted')}>接受问题</Button>
-                  <Button size="small" variant={review.status === 'ignored' ? 'contained' : 'outlined'} color="inherit" startIcon={<Block />} onClick={() => store.setReviewStatus(warning.id, 'ignored')}>忽略警告</Button>
+                  <Button size="small" disabled={!canReview} variant={review.status === 'accepted' ? 'contained' : 'outlined'} startIcon={<CheckCircle />} onClick={() => store.setReviewStatus(warning.id, 'accepted')}>接受问题</Button>
+                  <Button size="small" disabled={!canReview} variant={review.status === 'ignored' ? 'contained' : 'outlined'} color="inherit" startIcon={<Block />} onClick={() => store.setReviewStatus(warning.id, 'ignored')}>忽略警告</Button>
                   <Button size="small" onClick={() => openScene(warning.sceneId)}>打开场景</Button>
                 </Stack>
                 {review.replies.length > 0 && (
@@ -389,6 +556,7 @@ export default function App() {
                     maxRows={3}
                     placeholder="作者回复：说明修改理由或保留原设定"
                     value={replyDrafts[warning.id] ?? ''}
+                    disabled={!canReview}
                     onChange={(event) => setReplyDrafts((previous) => ({ ...previous, [warning.id]: event.target.value }))}
                     onKeyDown={(event) => {
                       if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
@@ -397,7 +565,7 @@ export default function App() {
                       }
                     }}
                   />
-                  <Button startIcon={<Reply />} variant="outlined" onClick={() => {
+                  <Button startIcon={<Reply />} variant="outlined" disabled={!canReview} onClick={() => {
                     store.addReply(warning.id, state.script.writer, replyDrafts[warning.id] ?? '')
                     setReplyDrafts((previous) => ({ ...previous, [warning.id]: '' }))
                   }}>回复</Button>
@@ -422,6 +590,21 @@ export default function App() {
           </Box>
           <Button variant="contained" startIcon={<Save />} onClick={() => setVersionDialog(true)}>保存版本</Button>
         </Stack>
+        {state.lastMerge && (
+          <Paper className="orphan-panel" elevation={0}>
+            <Typography variant="h6">未自动套用的审阅决定</Typography>
+            <Typography variant="body2" color="text.secondary" mb={1.5}>这些警告状态和回复属于原工作稿；对应场景或警告内容在合并后变化，因此只归档、不套到新场景。</Typography>
+            {state.lastMerge.orphanReviews.length === 0 && <Alert severity="success">没有遗留审阅决定。</Alert>}
+            {state.lastMerge.orphanReviews.map((orphan) => (
+              <Box key={orphan.warningId} className="orphan-row">
+                <Chip size="small" label={orphan.warning?.type ?? '旧警告'} />
+                <strong>{orphan.warning?.title ?? orphan.warningId}</strong>
+                <span>{orphan.reason}</span>
+                <small>{orphan.review.status === 'accepted' ? '已接受' : orphan.review.status === 'ignored' ? '已忽略' : '待审'} · {orphan.review.replies.length} 条回复</small>
+              </Box>
+            ))}
+          </Paper>
+        )}
         <Box className="version-layout">
           <Paper className="version-list" elevation={0}>
             <Typography variant="h6">历史版本</Typography>
@@ -430,6 +613,7 @@ export default function App() {
                 <ListItemButton key={version.id} selected={version.id === selectedVersion?.id} onClick={() => setSelectedVersionId(version.id)}>
                   <Box>
                     <Typography fontWeight={700}>{version.name}</Typography>
+                    {version.mergeSnapshot && <Chip size="small" color="secondary" label="合并前完整稿" sx={{ mr: 1 }} />}
                     <Typography variant="caption" color="text.secondary">{new Date(version.createdAt).toLocaleString('zh-CN')}</Typography>
                   </Box>
                 </ListItemButton>
@@ -441,9 +625,9 @@ export default function App() {
             <Stack direction="row" justifyContent="space-between" alignItems="center" mb={2}>
               <Box>
                 <Typography variant="h6">{selectedVersion ? `${selectedVersion.name} → 当前工作稿` : '等待选择版本'}</Typography>
-                <Typography variant="body2" color="text.secondary">{diff.length} 处字段差异</Typography>
+                <Typography variant="body2" color="text.secondary">{selectedVersion?.mergeSnapshot ? '恢复会把两个标签页都撤回到合并前完整稿。' : `${diff.length} 处字段差异`}</Typography>
               </Box>
-              {selectedVersion && <Button onClick={() => store.restoreVersion(selectedVersion.id)}>恢复此版本</Button>}
+              {selectedVersion && <Button onClick={() => store.restoreVersion(selectedVersion.id)}>{selectedVersion.mergeSnapshot ? '撤销合并并恢复双稿' : '恢复此版本'}</Button>}
             </Stack>
             <Divider />
             <Box className="diff-list">
@@ -476,7 +660,7 @@ export default function App() {
             </Box>
           </Stack>
           <Stack direction="row" gap={1} alignItems="center" className="project-title">
-            <input value={state.script.title} aria-label="剧本标题" onChange={(event) => store.updateScriptField('title', event.target.value)} />
+            <input value={state.script.title} aria-label="剧本标题" disabled={!canEditScript} onChange={(event) => store.updateScriptField('title', event.target.value)} />
             <span>{state.script.draft}</span>
           </Stack>
           <TextField
@@ -490,6 +674,8 @@ export default function App() {
           <Stack direction="row" gap={.5}>
             <Tooltip title="撤销 ⌘Z"><IconButton onClick={store.undo}><Undo /></IconButton></Tooltip>
             <Tooltip title="重做 ⇧⌘Z"><IconButton onClick={store.redo}><Redo /></IconButton></Tooltip>
+            <Tooltip title="双人分工"><IconButton onClick={openCollaboration}><Groups /></IconButton></Tooltip>
+            <Tooltip title="恢复后合并"><IconButton onClick={() => { setMergeNotice(''); isPaired ? handleStartMerge() : setView('merge') }}><Merge /></IconButton></Tooltip>
             <Tooltip title="资料库"><IconButton onClick={() => setLibraryOpen(true)}><Storage /></IconButton></Tooltip>
             <Tooltip title="键盘快捷键"><IconButton onClick={() => setShortcutOpen(true)}><Keyboard /></IconButton></Tooltip>
             <Button variant="contained" startIcon={<Save />} onClick={() => setVersionDialog(true)}>保存版本</Button>
@@ -499,6 +685,7 @@ export default function App() {
 
       <Box className="status-strip">
         <span>{store.saveStatus === 'saved' ? '● 已保存到本机' : '◌ 正在保存'}</span>
+        <span>{state.workspace?.role === 'review' ? '审阅与回复所有权' : '场景、道具、服装所有权'}{isPaired ? ' · 双人分工' : ' · 个人工作稿'}</span>
         <span>{state.script.scenes.length} 场 / {state.script.scenes.reduce((total, scene) => total + scene.pageLength, 0).toFixed(2)} 页</span>
         <span className={pendingWarnings.length ? 'attention' : ''}>{pendingWarnings.length} 条问题待审</span>
         <span>所有修改自动保存在浏览器本地</span>
@@ -526,8 +713,28 @@ export default function App() {
         <Tab value="outline" label="大纲视图" />
         <Tab value="detail" label="场景详情" />
         <Tab value="warnings" label={<Badge badgeContent={pendingWarnings.length} color="warning"><span className="tab-label">警告审阅</span></Badge>} />
+        <Tab value="merge" label={<Badge badgeContent={mergeSession ? unresolvedConflicts.length || '✓' : 0} color={mergeSession ? 'success' : 'default'}><span className="tab-label">双人合并</span></Badge>} />
         <Tab value="versions" label={<Badge badgeContent={state.versions.length} color="secondary"><span className="tab-label">版本差异</span></Badge>} />
       </Tabs>
+
+      {mergeSession && (
+        <Alert
+          className="merge-alert"
+          severity="warning"
+          action={<Button color="inherit" size="small" onClick={() => setView('merge')}>继续合并</Button>}
+        >
+          合并仍在进行：{unresolvedConflicts.length} 项待选定。中断或关闭页面后，待选定内容不会丢失。
+        </Alert>
+      )}
+      {state.lastMerge && !mergeSession && (
+        <Alert
+          className="merge-alert"
+          severity="success"
+          action={<Button color="inherit" size="small" onClick={() => store.undoLastMerge()}>撤销回到合并前</Button>}
+        >
+          合并已完成：自动合入 {state.lastMerge.autoMergedCount} 处，人工选定 {state.lastMerge.conflictCount} 处；{state.lastMerge.orphanReviews.length} 条旧审阅决定未套到新内容。
+        </Alert>
+      )}
 
       <Box component="main" className="main-content">
         {query && (
@@ -550,6 +757,7 @@ export default function App() {
         {view === 'outline' && renderOutline()}
         {view === 'detail' && renderSceneDetail()}
         {view === 'warnings' && renderWarnings()}
+        {view === 'merge' && renderMerge()}
         {view === 'versions' && renderVersions()}
       </Box>
 
@@ -564,46 +772,47 @@ export default function App() {
           <Tab value="wardrobe" label="服装" />
           <Tab value="timeline" label="时间线" />
         </Tabs>
+        {isPaired && !canEditScript && <Alert severity="info" sx={{ mx: 2, mt: 1 }}>当前是审阅与回复工作稿，资料库仅供查看。</Alert>}
         <Box className="drawer-content">
           {libraryTab === 'characters' && (
             <Stack gap={1.5}>
-              <Button startIcon={<Add />} variant="outlined" onClick={store.addCharacter}>新增角色</Button>
+              <Button startIcon={<Add />} variant="outlined" disabled={!canEditScript} onClick={store.addCharacter}>新增角色</Button>
               {state.script.characters.map((character) => (
                 <Paper className="library-card" key={character.id}>
-                  <TextField label="姓名" value={character.name} onChange={(event) => store.updateCharacter(character.id, 'name', event.target.value)} />
-                  <TextField label="演员" value={character.actor} onChange={(event) => store.updateCharacter(character.id, 'actor', event.target.value)} />
-                  <TextField select label="首次建立场景" value={character.introducedSceneId} onChange={(event) => store.updateCharacter(character.id, 'introducedSceneId', event.target.value)}>
+                  <TextField label="姓名" value={character.name} disabled={!canEditScript} onChange={(event) => store.updateCharacter(character.id, 'name', event.target.value)} />
+                  <TextField label="演员" value={character.actor} disabled={!canEditScript} onChange={(event) => store.updateCharacter(character.id, 'actor', event.target.value)} />
+                  <TextField select label="首次建立场景" value={character.introducedSceneId} disabled={!canEditScript} onChange={(event) => store.updateCharacter(character.id, 'introducedSceneId', event.target.value)}>
                     {state.script.scenes.map((scene) => <MenuItem key={scene.id} value={scene.id}>场景 {scene.number} · {scene.slug}</MenuItem>)}
                   </TextField>
-                  <TextField label="创作备注" value={character.note} onChange={(event) => store.updateCharacter(character.id, 'note', event.target.value)} />
+                  <TextField label="创作备注" value={character.note} disabled={!canEditScript} onChange={(event) => store.updateCharacter(character.id, 'note', event.target.value)} />
                 </Paper>
               ))}
             </Stack>
           )}
           {libraryTab === 'props' && (
             <Stack gap={1.5}>
-              <Button startIcon={<Add />} variant="outlined" onClick={store.addProp}>新增道具</Button>
+              <Button startIcon={<Add />} variant="outlined" disabled={!canEditScript} onClick={store.addProp}>新增道具</Button>
               {state.script.props.map((prop) => (
                 <Paper className="library-card" key={prop.id}>
-                  <TextField label="道具" value={prop.name} onChange={(event) => store.updateProp(prop.id, 'name', event.target.value)} />
-                  <TextField select label="首次建立场景" value={prop.introducedSceneId} onChange={(event) => store.updateProp(prop.id, 'introducedSceneId', event.target.value)}>
+                  <TextField label="道具" value={prop.name} disabled={!canEditScript} onChange={(event) => store.updateProp(prop.id, 'name', event.target.value)} />
+                  <TextField select label="首次建立场景" value={prop.introducedSceneId} disabled={!canEditScript} onChange={(event) => store.updateProp(prop.id, 'introducedSceneId', event.target.value)}>
                     {state.script.scenes.map((scene) => <MenuItem key={scene.id} value={scene.id}>场景 {scene.number} · {scene.slug}</MenuItem>)}
                   </TextField>
-                  <TextField select label="持有人" value={prop.ownerId} onChange={(event) => store.updateProp(prop.id, 'ownerId', event.target.value)}>
+                  <TextField select label="持有人" value={prop.ownerId} disabled={!canEditScript} onChange={(event) => store.updateProp(prop.id, 'ownerId', event.target.value)}>
                     {state.script.characters.map((character) => <MenuItem key={character.id} value={character.id}>{character.name}</MenuItem>)}
                   </TextField>
-                  <TextField label="连续性备注" value={prop.note} onChange={(event) => store.updateProp(prop.id, 'note', event.target.value)} />
+                  <TextField label="连续性备注" value={prop.note} disabled={!canEditScript} onChange={(event) => store.updateProp(prop.id, 'note', event.target.value)} />
                 </Paper>
               ))}
             </Stack>
           )}
           {libraryTab === 'wardrobe' && (
             <Stack gap={1.5}>
-              <Button startIcon={<Add />} variant="outlined" onClick={store.addWardrobe}>新增服装</Button>
+              <Button startIcon={<Add />} variant="outlined" disabled={!canEditScript} onClick={store.addWardrobe}>新增服装</Button>
               {state.script.wardrobes.map((wardrobe) => (
                 <Paper className="library-card" key={wardrobe.id}>
-                  <TextField label="服装" value={wardrobe.name} onChange={(event) => store.updateWardrobe(wardrobe.id, 'name', event.target.value)} />
-                  <TextField select label="所属角色" value={wardrobe.characterId} onChange={(event) => store.updateWardrobe(wardrobe.id, 'characterId', event.target.value)}>
+                  <TextField label="服装" value={wardrobe.name} disabled={!canEditScript} onChange={(event) => store.updateWardrobe(wardrobe.id, 'name', event.target.value)} />
+                  <TextField select label="所属角色" value={wardrobe.characterId} disabled={!canEditScript} onChange={(event) => store.updateWardrobe(wardrobe.id, 'characterId', event.target.value)}>
                     {state.script.characters.map((character) => <MenuItem key={character.id} value={character.id}>{character.name}</MenuItem>)}
                   </TextField>
                   <Box>
@@ -615,12 +824,12 @@ export default function App() {
                           label={period}
                           color={wardrobe.timePeriods.includes(period) ? 'primary' : 'default'}
                           variant={wardrobe.timePeriods.includes(period) ? 'filled' : 'outlined'}
-                          onClick={() => store.updateWardrobe(wardrobe.id, 'timePeriods', wardrobe.timePeriods.includes(period) ? wardrobe.timePeriods.filter((item) => item !== period) : [...wardrobe.timePeriods, period])}
+                          onClick={() => canEditScript && store.updateWardrobe(wardrobe.id, 'timePeriods', wardrobe.timePeriods.includes(period) ? wardrobe.timePeriods.filter((item) => item !== period) : [...wardrobe.timePeriods, period])}
                         />
                       ))}
                     </Box>
                   </Box>
-                  <TextField label="连续性备注" value={wardrobe.note} onChange={(event) => store.updateWardrobe(wardrobe.id, 'note', event.target.value)} />
+                  <TextField label="连续性备注" value={wardrobe.note} disabled={!canEditScript} onChange={(event) => store.updateWardrobe(wardrobe.id, 'note', event.target.value)} />
                 </Paper>
               ))}
             </Stack>
@@ -633,13 +842,13 @@ export default function App() {
                     <Box className="scene-number small">{scene.number}</Box>
                     <Typography fontWeight={750}>{scene.slug}</Typography>
                   </Stack>
-                  <TextField label="故事时间" value={scene.storyTime} onChange={(event) => store.updateScene(scene.id, 'storyTime', event.target.value)} />
-                  <TextField select label="日夜" value={scene.dayNight} onChange={(event) => store.updateScene(scene.id, 'dayNight', event.target.value)}>
+                  <TextField label="故事时间" value={scene.storyTime} disabled={!canEditScript} onChange={(event) => store.updateScene(scene.id, 'storyTime', event.target.value)} />
+                  <TextField select label="日夜" value={scene.dayNight} disabled={!canEditScript} onChange={(event) => store.updateScene(scene.id, 'dayNight', event.target.value)}>
                     {dayNightOptions.map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
                   </TextField>
                   <Stack direction="row" gap={1}>
-                    <Button disabled={index === 0} onClick={() => store.moveScene(scene.id, -1)}>前移</Button>
-                    <Button disabled={index === state.script.scenes.length - 1} onClick={() => store.moveScene(scene.id, 1)}>后移</Button>
+                    <Button disabled={!canEditScript || index === 0} onClick={() => store.moveScene(scene.id, -1)}>前移</Button>
+                    <Button disabled={!canEditScript || index === state.script.scenes.length - 1} onClick={() => store.moveScene(scene.id, 1)}>后移</Button>
                   </Stack>
                 </Paper>
               ))}
@@ -655,6 +864,33 @@ export default function App() {
           <TextField autoFocus fullWidth label="版本名称" value={versionName} onChange={(event) => setVersionName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') createVersion() }} />
         </DialogContent>
         <DialogActions><Button onClick={() => setVersionDialog(false)}>取消</Button><Button variant="contained" onClick={createVersion}>保存</Button></DialogActions>
+      </Dialog>
+
+      <Dialog open={collaborationOpen} onClose={() => setCollaborationOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>断网双标签页工作稿</DialogTitle>
+        <DialogContent>
+          <Stack gap={1.5} mt={1}>
+            <Alert severity="info">
+              当前：{state.workspace?.name}（{state.workspace?.role === 'review' ? '警告、审阅决定和回复' : '场景、道具、服装'}）。
+              点击后会创建配套标签页；两页都保存在本机，断网仍可编辑。
+            </Alert>
+            <Button variant="contained" startIcon={<Groups />} onClick={() => store.startCollaboration()}>
+              {isPaired ? '打开配套标签页' : '创建并打开另一工作稿'}
+            </Button>
+            {isPaired && <Button startIcon={<Merge />} variant="outlined" onClick={handleStartMerge}>恢复后开始合并</Button>}
+            <Divider>本机工作稿</Divider>
+            {workspaces.map((workspace) => (
+              <Paper key={workspace.id} className="workspace-row" elevation={0}>
+                <Box>
+                  <Typography fontWeight={750}>{workspace.name}{workspace.id === state.workspace.id && '（当前）'}</Typography>
+                  <Typography variant="caption" color="text.secondary">{workspace.role === 'review' ? '警告和回复' : '场景道具服装'} · {new Date(workspace.updatedAt).toLocaleString('zh-CN')}</Typography>
+                </Box>
+                <Link href={workspaceUrl(workspace.id, workspace.role)} target="_blank" rel="noreferrer">打开</Link>
+              </Paper>
+            ))}
+          </Stack>
+        </DialogContent>
+        <DialogActions><Button onClick={() => setCollaborationOpen(false)}>关闭</Button></DialogActions>
       </Dialog>
 
       <Dialog open={shortcutOpen} onClose={() => setShortcutOpen(false)} fullWidth maxWidth="xs">

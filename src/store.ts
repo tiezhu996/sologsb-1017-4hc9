@@ -1,22 +1,131 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sampleScript } from './sample'
-import type { Character, ContinuityState, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
+import { mergeScripts, migrateReviews } from './merge'
+import type { Character, ContinuityState, DraftSnapshot, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningItem, WarningReview, WorkspaceInfo, WorkspaceRole, WorkspaceSummary, MergeSide, MergeSession } from './types'
 
 const STORAGE_KEY = 'sologsb-1017-continuity-v1'
+const WORKSPACE_PREFIX = `${STORAGE_KEY}:workspace:`
+const TAB_WORKSPACE_KEY = 'sologsb-1017-workspace'
 const clone = <T,>(value: T): T => structuredClone(value)
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 
-function initialState(): ContinuityState {
+function workspaceStorageKey(workspaceId: string) {
+  return `${WORKSPACE_PREFIX}${workspaceId}`
+}
+
+function getInitialWorkspaceId(): string {
+  const params = new URLSearchParams(window.location.search)
+  const fromUrl = params.get('workspace')
+  if (fromUrl) {
+    sessionStorage.setItem(TAB_WORKSPACE_KEY, fromUrl)
+    return fromUrl
+  }
+  const fromSession = sessionStorage.getItem(TAB_WORKSPACE_KEY)
+  if (fromSession) return fromSession
+  const generated = `production-${Date.now().toString(36)}`
+  sessionStorage.setItem(TAB_WORKSPACE_KEY, generated)
+  return generated
+}
+
+function emptyWorkspace(idValue: string, role: WorkspaceRole, name: string, state?: Partial<ContinuityState>): ContinuityState {
+  return {
+    script: clone(sampleScript),
+    reviews: {},
+    versions: [],
+    updatedAt: new Date().toISOString(),
+    activeMerge: null,
+    lastMerge: null,
+    ...state,
+    workspace: {
+      ...state?.workspace,
+      id: idValue,
+      name: state?.workspace?.name ?? name,
+      role,
+      startedAt: state?.workspace?.startedAt ?? new Date().toISOString()
+    }
+  }
+}
+
+function normalizeState(value: Partial<ContinuityState> | null | undefined, workspaceId: string, role: WorkspaceRole, name: string): ContinuityState {
+  const workspace: WorkspaceInfo = {
+    ...value?.workspace,
+    id: workspaceId,
+    name: value?.workspace?.name ?? name,
+    role,
+    startedAt: value?.workspace?.startedAt ?? new Date().toISOString()
+  }
+  return {
+    script: value?.script ?? clone(sampleScript),
+    reviews: value?.reviews ?? {},
+    versions: Array.isArray(value?.versions) ? value.versions : [],
+    updatedAt: value?.updatedAt ?? new Date().toISOString(),
+    activeMerge: value?.activeMerge ?? null,
+    lastMerge: value?.lastMerge ?? null,
+    workspace
+  }
+}
+
+function persistWorkspace(state: ContinuityState) {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw) as ContinuityState
-      if (parsed.script?.scenes?.length) return parsed
+    localStorage.setItem(workspaceStorageKey(state.workspace.id), JSON.stringify(state))
+  } catch {
+    // Storage may be unavailable in private modes; the in-memory draft still works for this session.
+  }
+}
+
+function readWorkspace(workspaceId: string): ContinuityState | null {
+  try {
+    const raw = localStorage.getItem(workspaceStorageKey(workspaceId))
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<ContinuityState>
+    const role: WorkspaceRole = parsed.workspace?.role ?? 'production'
+    return normalizeState(parsed, workspaceId, role, parsed.workspace?.name ?? (role === 'review' ? '审阅与回复工作稿' : '场景道具工作稿'))
+  } catch {
+    return null
+  }
+}
+
+function initialState(workspaceId: string): ContinuityState {
+  const existing = readWorkspace(workspaceId)
+  if (existing?.script?.scenes?.length) return existing
+
+  try {
+    const legacyRaw = localStorage.getItem(STORAGE_KEY)
+    if (legacyRaw) {
+      const parsed = JSON.parse(legacyRaw) as Partial<ContinuityState>
+      if (parsed.script?.scenes?.length) {
+        const state = normalizeState(parsed, workspaceId, 'production', '场景道具工作稿')
+        persistWorkspace(state)
+        return state
+      }
     }
   } catch {
-    // Ignore an invalid local draft and restore the bundled example.
+    // Ignore an invalid legacy draft and restore the bundled example.
   }
-  return { script: clone(sampleScript), reviews: {}, versions: [], updatedAt: new Date().toISOString() }
+  const role: WorkspaceRole = new URLSearchParams(window.location.search).get('role') === 'review' ? 'review' : 'production'
+  const state = emptyWorkspace(workspaceId, role, role === 'review' ? '审阅与回复工作稿' : '场景道具工作稿')
+  persistWorkspace(state)
+  return state
+}
+
+export function listWorkspaces(): WorkspaceSummary[] {
+  const result: WorkspaceSummary[] = []
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index)
+    if (!key?.startsWith(WORKSPACE_PREFIX)) continue
+    const workspaceId = key.slice(WORKSPACE_PREFIX.length)
+    const state = readWorkspace(workspaceId)
+    if (!state?.workspace) continue
+    result.push({ ...state.workspace, updatedAt: state.updatedAt })
+  }
+  return result.sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+}
+
+export function workspaceUrl(workspaceId: string, role: WorkspaceRole) {
+  const url = new URL(window.location.href)
+  url.searchParams.set('workspace', workspaceId)
+  url.searchParams.set('role', role)
+  return url.toString()
 }
 
 export function deriveWarnings(script: Script): WarningItem[] {
@@ -79,7 +188,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
       }
     })
 
-    if (index > 0 && script.scenes[index - 1].storyTime && scene.storyTime && index > 0) {
+    if (index > 0 && script.scenes[index - 1].storyTime && scene.storyTime) {
       const previous = script.scenes[index - 1]
       const previousDay = previous.storyTime.match(/第\s*(\d+)\s*天/)?.[1]
       const currentDay = scene.storyTime.match(/第\s*(\d+)\s*天/)?.[1]
@@ -135,40 +244,64 @@ export function diffScript(base: Script, current: Script): DiffItem[] {
   return result
 }
 
+const currentWorkspaceId = getInitialWorkspaceId()
+
 export function useContinuityStore() {
-  const [state, setState] = useState<ContinuityState>(initialState)
+  const [state, setState] = useState<ContinuityState>(() => initialState(currentWorkspaceId))
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving'>('saved')
-  const undoRef = useRef<Script[]>([])
-  const redoRef = useRef<Script[]>([])
+  const undoRef = useRef<ContinuityState[]>([])
+  const redoRef = useRef<ContinuityState[]>([])
   const saveTimer = useRef<number | undefined>(undefined)
+  const stateRef = useRef(state)
+  stateRef.current = state
 
   useEffect(() => {
     setSaveStatus('saving')
     window.clearTimeout(saveTimer.current)
     saveTimer.current = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+      persistWorkspace(state)
       setSaveStatus('saved')
-    }, 160)
+    }, 80)
     return () => window.clearTimeout(saveTimer.current)
   }, [state])
 
-  const mutate = useCallback((mutator: (script: Script) => void) => {
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== workspaceStorageKey(currentWorkspaceId)) return
+      const next = readWorkspace(currentWorkspaceId)
+      if (next) setState(next)
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
+  const commit = useCallback((updater: (previous: ContinuityState) => ContinuityState) => {
     setState((previous) => {
-      const next = clone(previous.script)
-      mutator(next)
-      undoRef.current.push(clone(previous.script))
-      if (undoRef.current.length > 80) undoRef.current.shift()
+      const next = { ...updater(previous), updatedAt: new Date().toISOString() }
+      if (JSON.stringify(next) === JSON.stringify(previous)) return previous
+      undoRef.current.push(clone(previous))
+      if (undoRef.current.length > 100) undoRef.current.shift()
       redoRef.current = []
-      return { ...previous, script: next, updatedAt: new Date().toISOString() }
+      persistWorkspace(next)
+      return next
     })
   }, [])
+
+  const mutate = useCallback((mutator: (script: Script) => void) => {
+    commit((previous) => {
+      const next = clone(previous)
+      mutator(next.script)
+      return next
+    })
+  }, [commit])
 
   const undo = useCallback(() => {
     setState((previous) => {
       const target = undoRef.current.pop()
       if (!target) return previous
-      redoRef.current.push(clone(previous.script))
-      return { ...previous, script: target, updatedAt: new Date().toISOString() }
+      redoRef.current.push(clone(previous))
+      persistWorkspace(target)
+      return { ...target, updatedAt: new Date().toISOString() }
     })
   }, [])
 
@@ -176,8 +309,9 @@ export function useContinuityStore() {
     setState((previous) => {
       const target = redoRef.current.pop()
       if (!target) return previous
-      undoRef.current.push(clone(previous.script))
-      return { ...previous, script: target, updatedAt: new Date().toISOString() }
+      undoRef.current.push(clone(previous))
+      persistWorkspace(target)
+      return { ...target, updatedAt: new Date().toISOString() }
     })
   }, [])
 
@@ -280,20 +414,19 @@ export function useContinuityStore() {
   }, [mutate])
 
   const setReviewStatus = useCallback((warningId: string, status: WarningReview['status']) => {
-    setState((previous) => ({
+    commit((previous) => ({
       ...previous,
       reviews: {
         ...previous.reviews,
         [warningId]: { ...(previous.reviews[warningId] ?? { replies: [] }), status }
-      },
-      updatedAt: new Date().toISOString()
+      }
     }))
-  }, [])
+  }, [commit])
 
   const addReply = useCallback((warningId: string, author: string, text: string) => {
     if (!text.trim()) return
     const reply: Reply = { id: id('reply'), author, text: text.trim(), createdAt: new Date().toISOString() }
-    setState((previous) => ({
+    commit((previous) => ({
       ...previous,
       reviews: {
         ...previous.reviews,
@@ -301,27 +434,310 @@ export function useContinuityStore() {
           status: previous.reviews[warningId]?.status ?? 'pending',
           replies: [...(previous.reviews[warningId]?.replies ?? []), reply]
         }
-      },
-      updatedAt: new Date().toISOString()
+      }
     }))
-  }, [])
+  }, [commit])
 
   const createVersion = useCallback((name: string) => {
-    const version: Version = { id: id('version'), name: name.trim() || `版本 ${state.versions.length + 1}`, createdAt: new Date().toISOString(), script: clone(state.script) }
-    setState((previous) => ({ ...previous, versions: [version, ...previous.versions] }))
+    const version: Version = {
+      id: id('version'),
+      name: name.trim() || `版本 ${stateRef.current.versions.length + 1}`,
+      createdAt: new Date().toISOString(),
+      script: clone(stateRef.current.script),
+      reviews: clone(stateRef.current.reviews)
+    }
+    commit((previous) => ({ ...previous, versions: [version, ...previous.versions] }))
     return version
-  }, [state.script, state.versions.length])
+  }, [commit])
+
+  const writeBothWorkspaces = useCallback((production: ContinuityState, review: ContinuityState) => {
+    persistWorkspace(production)
+    persistWorkspace(review)
+    setState((previous) => previous.workspace.role === 'review' ? { ...review, updatedAt: new Date().toISOString() } : { ...production, updatedAt: new Date().toISOString() })
+  }, [])
+
+  const startCollaboration = useCallback(() => {
+    const current = clone(stateRef.current)
+    const role: WorkspaceRole = current.workspace.role
+    const isProduction = role === 'production'
+
+    if (current.workspace.partnerId) {
+      const partner = readWorkspace(current.workspace.partnerId)
+      if (partner) {
+        window.open(workspaceUrl(partner.workspace.id, partner.workspace.role), '_blank', 'noopener,noreferrer')
+        return { productionId: isProduction ? current.workspace.id : partner.workspace.id, reviewId: isProduction ? partner.workspace.id : current.workspace.id }
+      }
+    }
+
+    const now = new Date().toISOString()
+    let productionState: ContinuityState
+    let reviewState: ContinuityState
+    let productionId: string
+    let reviewId: string
+    const baseVersion: Version = {
+      id: id('version'),
+      name: `双人分工基线 · ${new Date().toLocaleString('zh-CN')}`,
+      createdAt: now,
+      script: clone(current.script),
+      reviews: clone(current.reviews)
+    }
+
+    if (isProduction) {
+      productionId = current.workspace.id
+      reviewId = `review-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+      productionState = {
+        ...current,
+        versions: [baseVersion, ...current.versions],
+        activeMerge: null,
+        lastMerge: null,
+        workspace: { ...current.workspace, role: 'production', name: '场景道具工作稿', partnerId: reviewId, baseVersionId: baseVersion.id }
+      }
+      reviewState = emptyWorkspace(reviewId, 'review', '审阅与回复工作稿', {
+        script: clone(current.script),
+        reviews: clone(current.reviews),
+        versions: [clone(baseVersion)],
+        workspace: { id: reviewId, name: '审阅与回复工作稿', role: 'review', partnerId: productionId, baseVersionId: baseVersion.id, startedAt: now }
+      })
+    } else {
+      reviewId = current.workspace.id
+      productionId = `production-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+      reviewState = {
+        ...current,
+        versions: [baseVersion, ...current.versions],
+        activeMerge: null,
+        lastMerge: null,
+        workspace: { ...current.workspace, role: 'review', name: '审阅与回复工作稿', partnerId: productionId, baseVersionId: baseVersion.id }
+      }
+      productionState = emptyWorkspace(productionId, 'production', '场景道具工作稿', {
+        script: clone(current.script),
+        reviews: clone(current.reviews),
+        versions: [clone(baseVersion)],
+        workspace: { id: productionId, name: '场景道具工作稿', role: 'production', partnerId: reviewId, baseVersionId: baseVersion.id, startedAt: now }
+      })
+    }
+
+    const newWorkspaceId = isProduction ? reviewId : productionId
+    const newWorkspaceRole: WorkspaceRole = isProduction ? 'review' : 'production'
+    writeBothWorkspaces(productionState, reviewState)
+    window.open(workspaceUrl(newWorkspaceId, newWorkspaceRole), '_blank', 'noopener,noreferrer')
+    return { productionId, reviewId }
+  }, [writeBothWorkspaces])
+
+  const getMergePair = useCallback(() => {
+    const current = stateRef.current
+    if (!current.workspace.partnerId || !current.workspace.baseVersionId) return null
+    const partner = readWorkspace(current.workspace.partnerId)
+    if (!partner?.workspace) return null
+    const baseVersion = current.versions.find((version) => version.id === current.workspace.baseVersionId)
+    if (!baseVersion) return null
+    const production = current.workspace.role === 'production' ? current : partner
+    const review = current.workspace.role === 'review' ? current : partner
+    return { current, partner, baseVersion, production, review }
+  }, [])
+
+  const startMerge = useCallback((): { ok: boolean; message?: string } => {
+    const pair = getMergePair()
+    if (!pair) return { ok: false, message: '请先开启双人分工，并确认两个工作稿仍共享同一基线。' }
+    const { baseVersion, production, review } = pair
+    if (stateRef.current.activeMerge) return { ok: true }
+
+    const merged = mergeScripts(baseVersion.script, production.script, review.script)
+    const preMergeVersion: Version = {
+      id: id('version'),
+      name: `合并前完整稿 · ${new Date().toLocaleString('zh-CN')}`,
+      createdAt: new Date().toISOString(),
+      script: clone(baseVersion.script),
+      reviews: clone(baseVersion.reviews ?? {}),
+      mergeBaseVersionId: baseVersion.id,
+      mergeSnapshot: {
+        production: { script: clone(production.script), reviews: clone(production.reviews) },
+        review: { script: clone(review.script), reviews: clone(review.reviews) }
+      }
+    }
+    const session: MergeSession = {
+      id: id('merge'),
+      name: `双人工作稿合并 · ${new Date().toLocaleString('zh-CN')}`,
+      startedAt: new Date().toISOString(),
+      preMergeVersionId: preMergeVersion.id,
+      baseVersionId: baseVersion.id,
+      productionWorkspaceId: production.workspace.id,
+      productionWorkspaceName: production.workspace.name,
+      reviewWorkspaceId: review.workspace.id,
+      reviewWorkspaceName: review.workspace.name,
+      productionDraft: { script: clone(production.script), reviews: clone(production.reviews) },
+      reviewDraft: { script: clone(review.script), reviews: clone(review.reviews) },
+      mergedScript: merged.script,
+      conflicts: merged.conflicts,
+      autoChanges: merged.autoChanges
+    }
+
+    const nextProduction: ContinuityState = {
+      ...production,
+      versions: [preMergeVersion, ...production.versions],
+      activeMerge: session
+    }
+    const nextReview: ContinuityState = {
+      ...review,
+      versions: [clone(preMergeVersion), ...review.versions],
+      activeMerge: clone(session)
+    }
+    writeBothWorkspaces(nextProduction, nextReview)
+    return { ok: true }
+  }, [getMergePair, writeBothWorkspaces])
+
+  const rebuildMerge = useCallback((previous: ContinuityState, session: MergeSession, resolutions: Record<string, MergeSide>) => {
+    const baseVersion = previous.versions.find((version) => version.id === session.baseVersionId)
+    if (!baseVersion) return session
+    const merged = mergeScripts(baseVersion.script, session.productionDraft.script, session.reviewDraft.script, resolutions)
+    return { ...session, mergedScript: merged.script, conflicts: merged.conflicts, autoChanges: merged.autoChanges }
+  }, [])
+
+  const resolveMergeConflict = useCallback((conflictId: string, side: MergeSide) => {
+    const current = stateRef.current
+    if (!current.activeMerge) return
+    const session = clone(current.activeMerge)
+    const resolutions: Record<string, MergeSide> = {}
+    session.conflicts.forEach((conflict) => {
+      if (conflict.resolution) resolutions[conflict.id] = conflict.resolution
+    })
+    resolutions[conflictId] = side
+    const productionId = session.productionWorkspaceId
+    const reviewId = session.reviewWorkspaceId
+    const productionRaw = current.workspace.id === productionId ? current : readWorkspace(productionId)
+    const reviewRaw = current.workspace.id === reviewId ? current : readWorkspace(reviewId)
+    if (!productionRaw || !reviewRaw) return
+
+    const productionSession = rebuildMerge(productionRaw, clone(session), resolutions)
+    const reviewSession = rebuildMerge(reviewRaw, clone(session), resolutions)
+    writeBothWorkspaces(
+      { ...productionRaw, activeMerge: productionSession },
+      { ...reviewRaw, activeMerge: reviewSession }
+    )
+  }, [rebuildMerge, writeBothWorkspaces])
+
+  const cancelMerge = useCallback(() => {
+    const current = stateRef.current
+    if (!current.activeMerge) return
+    const session = current.activeMerge
+    const productionRaw = current.workspace.id === session.productionWorkspaceId ? current : readWorkspace(session.productionWorkspaceId)
+    const reviewRaw = current.workspace.id === session.reviewWorkspaceId ? current : readWorkspace(session.reviewWorkspaceId)
+    if (!productionRaw || !reviewRaw) return
+    writeBothWorkspaces({ ...productionRaw, activeMerge: null }, { ...reviewRaw, activeMerge: null })
+  }, [writeBothWorkspaces])
+
+  const completeMerge = useCallback((): { ok: boolean; message?: string } => {
+    const current = stateRef.current
+    const session = current.activeMerge
+    if (!session) return { ok: false, message: '没有进行中的合并。' }
+    if (session.conflicts.some((conflict) => !conflict.resolution)) return { ok: false, message: '仍有同一字段的两版内容需要选定。' }
+
+    const preMergeVersionId = session.preMergeVersionId
+    const mergedWarnings = deriveWarnings(session.mergedScript)
+    const migration = migrateReviews({
+      mergedScript: session.mergedScript,
+      mergedWarnings,
+      production: { ...session.productionDraft, warnings: deriveWarnings(session.productionDraft.script) },
+      review: { ...session.reviewDraft, warnings: deriveWarnings(session.reviewDraft.script) }
+    })
+    const now = new Date().toISOString()
+    const postMergeVersion: Version = {
+      id: id('version'),
+      name: `合并后基线 · ${new Date().toLocaleString('zh-CN')}`,
+      createdAt: now,
+      script: clone(session.mergedScript),
+      reviews: clone(migration.migratedReviews)
+    }
+    const report = {
+      id: id('merge-report'),
+      completedAt: now,
+      preMergeVersionId,
+      autoMergedCount: session.autoChanges.length,
+      conflictCount: session.conflicts.length,
+      migratedReviews: migration.migratedReviews,
+      orphanReviews: migration.orphanReviews
+    }
+
+    const productionRaw = current.workspace.id === session.productionWorkspaceId ? current : readWorkspace(session.productionWorkspaceId)
+    const reviewRaw = current.workspace.id === session.reviewWorkspaceId ? current : readWorkspace(session.reviewWorkspaceId)
+    if (!productionRaw || !reviewRaw) return { ok: false, message: '找不到另一个工作稿，请不要关闭对应浏览器存储。' }
+
+    const production: ContinuityState = {
+      ...productionRaw,
+      script: clone(session.mergedScript),
+      reviews: clone(migration.migratedReviews),
+      versions: [postMergeVersion, ...productionRaw.versions],
+      activeMerge: null,
+      lastMerge: clone(report),
+      workspace: { ...productionRaw.workspace, baseVersionId: postMergeVersion.id }
+    }
+    const review: ContinuityState = {
+      ...reviewRaw,
+      script: clone(session.mergedScript),
+      reviews: clone(migration.migratedReviews),
+      versions: [clone(postMergeVersion), ...reviewRaw.versions],
+      activeMerge: null,
+      lastMerge: clone(report),
+      workspace: { ...reviewRaw.workspace, baseVersionId: postMergeVersion.id }
+    }
+    writeBothWorkspaces(production, review)
+    return { ok: true }
+  }, [writeBothWorkspaces])
+
+  const restoreMergeVersion = useCallback((version: Version) => {
+    if (!version.mergeSnapshot) return false
+    const current = stateRef.current
+    const productionId = current.activeMerge?.productionWorkspaceId ?? (current.workspace.role === 'production' ? current.workspace.id : current.workspace.partnerId)
+    const reviewId = current.activeMerge?.reviewWorkspaceId ?? (current.workspace.role === 'review' ? current.workspace.id : current.workspace.partnerId)
+    if (!productionId || !reviewId) return false
+    const productionOld = readWorkspace(productionId)
+    const reviewOld = readWorkspace(reviewId)
+    if (!productionOld || !reviewOld) return false
+    const snapshot = version.mergeSnapshot
+    const production: ContinuityState = {
+      ...productionOld,
+      script: clone(snapshot.production.script),
+      reviews: clone(snapshot.production.reviews),
+      activeMerge: null,
+      lastMerge: null,
+      workspace: { ...productionOld.workspace, baseVersionId: version.mergeBaseVersionId ?? productionOld.workspace.baseVersionId }
+    }
+    const review: ContinuityState = {
+      ...reviewOld,
+      script: clone(snapshot.review.script),
+      reviews: clone(snapshot.review.reviews),
+      activeMerge: null,
+      lastMerge: null,
+      workspace: { ...reviewOld.workspace, baseVersionId: version.mergeBaseVersionId ?? reviewOld.workspace.baseVersionId }
+    }
+    writeBothWorkspaces(production, review)
+    return true
+  }, [writeBothWorkspaces])
 
   const restoreVersion = useCallback((versionId: string) => {
-    const version = state.versions.find((item) => item.id === versionId)
+    const version = stateRef.current.versions.find((item) => item.id === versionId)
     if (!version) return
-    mutate((script) => { Object.assign(script, clone(version.script)) })
-  }, [mutate, state.versions])
+    if (version.mergeSnapshot) {
+      restoreMergeVersion(version)
+      return
+    }
+    commit((previous) => ({
+      ...previous,
+      script: clone(version.script),
+      reviews: clone(version.reviews ?? {})
+    }))
+  }, [commit, restoreMergeVersion])
+
+  const undoLastMerge = useCallback(() => {
+    const report = stateRef.current.lastMerge
+    if (!report?.preMergeVersionId) return false
+    const version = stateRef.current.versions.find((item) => item.id === report.preMergeVersionId)
+    if (!version?.mergeSnapshot) return false
+    return restoreMergeVersion(version)
+  }, [restoreMergeVersion])
 
   const reset = useCallback(() => {
-    mutate((script) => { Object.assign(script, clone(sampleScript)) })
-    setState((previous) => ({ ...previous, reviews: {} }))
-  }, [mutate])
+    commit((previous) => ({ ...previous, script: clone(sampleScript), reviews: {}, activeMerge: null, lastMerge: null }))
+  }, [commit])
 
   return {
     state,
@@ -344,6 +760,12 @@ export function useContinuityStore() {
     addReply,
     createVersion,
     restoreVersion,
+    undoLastMerge,
+    startCollaboration,
+    startMerge,
+    resolveMergeConflict,
+    cancelMerge,
+    completeMerge,
     undo,
     redo,
     reset

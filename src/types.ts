@@ -1,6 +1,8 @@
 export type RevisionColor = 'white' | 'blue' | 'pink' | 'yellow' | 'green' | 'goldenrod' | 'buff' | 'salmon' | 'cherry'
 export type WarningStatus = 'pending' | 'accepted' | 'ignored'
 export type WarningType = 'character' | 'prop' | 'wardrobe' | 'timeline'
+export type WorkspaceRole = 'production' | 'review'
+export type MergeSide = WorkspaceRole
 
 export interface Character {
   id: string
@@ -76,11 +78,93 @@ export interface WarningReview {
   replies: Reply[]
 }
 
+export interface DraftSnapshot {
+  script: Script
+  reviews: Record<string, WarningReview>
+}
+
 export interface Version {
   id: string
   name: string
   createdAt: string
   script: Script
+  reviews?: Record<string, WarningReview>
+  mergeSnapshot?: {
+    production: DraftSnapshot
+    review: DraftSnapshot
+  }
+  mergeBaseVersionId?: string
+}
+
+export interface WorkspaceInfo {
+  id: string
+  name: string
+  role: WorkspaceRole
+  partnerId?: string
+  baseVersionId?: string
+  startedAt: string
+}
+
+export interface WorkspaceSummary extends WorkspaceInfo {
+  updatedAt: string
+}
+
+export type MergeConflictScope = 'script' | 'scene' | 'character' | 'prop' | 'wardrobe'
+export type MergeConflictKind = 'field' | 'entity' | 'order'
+
+export interface MergeConflict {
+  id: string
+  kind: MergeConflictKind
+  scope: MergeConflictScope
+  entityId?: string
+  entityLabel?: string
+  field: string
+  fieldLabel: string
+  base: unknown
+  production: unknown
+  review: unknown
+  resolution: MergeSide | null
+}
+
+export interface MergeAutoChange {
+  id: string
+  label: string
+  detail: string
+  side: MergeSide | 'both'
+}
+
+export interface MergeSession {
+  id: string
+  name: string
+  startedAt: string
+  preMergeVersionId: string
+  baseVersionId: string
+  productionWorkspaceId: string
+  productionWorkspaceName: string
+  reviewWorkspaceId: string
+  reviewWorkspaceName: string
+  productionDraft: DraftSnapshot
+  reviewDraft: DraftSnapshot
+  mergedScript: Script
+  conflicts: MergeConflict[]
+  autoChanges: MergeAutoChange[]
+}
+
+export interface OrphanReview {
+  warningId: string
+  warning?: WarningItem
+  review: WarningReview
+  reason: string
+}
+
+export interface MergeReport {
+  id: string
+  completedAt: string
+  preMergeVersionId: string
+  autoMergedCount: number
+  conflictCount: number
+  migratedReviews: Record<string, WarningReview>
+  orphanReviews: OrphanReview[]
 }
 
 export interface ContinuityState {
@@ -88,6 +172,9 @@ export interface ContinuityState {
   reviews: Record<string, WarningReview>
   versions: Version[]
   updatedAt: string
+  workspace: WorkspaceInfo
+  activeMerge?: MergeSession | null
+  lastMerge?: MergeReport | null
 }
 
 export interface DiffItem {
